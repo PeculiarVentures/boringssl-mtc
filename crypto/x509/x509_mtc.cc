@@ -38,17 +38,17 @@ namespace {
 // Prefix for domain separation to denote a Merkle Tree leaf or interior node.
 constexpr uint8_t kMTCLeafDomainSeparator[] = {0x00};
 constexpr uint8_t kMTCNodeDomainSeparator[] = {0x01};
-// DER encoding of AlgorithmIdentifier for alg-mtcProof-draft with absent
+// DER encoding of AlgorithmIdentifier for id-alg-mtcProof with absent
 // parameters.
-//   SEQUENCE (12 bytes) {
-//     OBJECT IDENTIFIER 1.3.6.1.4.1.44363.47.0 (10 bytes)
+//   SEQUENCE (10 bytes) {
+//     OBJECT IDENTIFIER 1.3.6.1.5.5.7.6.67 (8 bytes)
 //   }
 constexpr uint8_t kMTCAlgorithmIdentifier[] = {
     0x30,  // SEQUENCE tag
-    12,    // tag + len + OID bytes
+    10,    // tag + len + OID bytes
     0x06,  // OBJECT tag
-    10,    // OID length
-    OBJ_ENC_alg_mtcProof_draft,
+    8,     // OID length
+    OBJ_ENC_alg_mtcProof,
 };
 // MTCLogEntryType enum value for tbs_cert_entry.
 constexpr uint8_t kMTCLogEntryTypeTBSCertEntry[] = {0x00, 0x01};
@@ -88,7 +88,7 @@ inline bool lsb(uint64_t n) { return n & 1; }
 
 // is_mtc_proof returns whether `algor` is an mtcProof AlgorithmIdentifier.
 bool is_mtc_proof(const X509_ALGOR *algor) {
-  return OBJ_obj2nid(algor->algorithm) == NID_alg_mtcProof_draft &&
+  return OBJ_obj2nid(algor->algorithm) == NID_alg_mtcProof &&
          algor->parameter == nullptr;
 }
 
@@ -150,7 +150,7 @@ class MTCCACosigner {
   bool Init(const X509 *x509, const EVP_PKEY *pkey) {
     // Get and parse the MTCCertificationAuthority extension (see section 5.5).
     int ext_index =
-        X509_get_ext_by_NID(x509, NID_pe_mtcCertificationAuthority_draft, -1);
+        X509_get_ext_by_NID(x509, NID_pe_mtcCertificationAuthority_SHA256, -1);
     const X509_EXTENSION *ext = X509_get_ext(x509, ext_index);
     if (ext == nullptr || !X509_EXTENSION_get_critical(ext)) {
       OPENSSL_PUT_ERROR(X509, X509_R_INVALID_MTC_CA);
@@ -161,52 +161,42 @@ class MTCCACosigner {
     CBS_init(&ext_value, ASN1_STRING_get0_data(value),
              ASN1_STRING_length(value));
 
-    CBS seq, log_hash;
-    if (!CBS_get_asn1(&ext_value, &seq, CBS_ASN1_SEQUENCE) ||         //
-        !CBS_get_asn1_element(&seq, &log_hash, CBS_ASN1_SEQUENCE) ||  //
-        !x509_parse_algorithm(&seq, cosign_sigalg_.get()) ||          //
-        !CBS_get_asn1_uint64(&seq, &min_serial_) ||                   //
-        !CBS_get_asn1_uint64(&seq, &max_serial_) ||                   //
-        CBS_len(&seq) != 0) {
+    CBS seq;
+    if (!CBS_get_asn1(&ext_value, &seq, CBS_ASN1_SEQUENCE) ||
+        CBS_len(&ext_value) != 0 ||
+        !x509_parse_algorithm(&seq, cosign_sigalg_.get()) ||
+        !CBS_get_asn1_uint64(&seq, &min_serial_) ||
+        !CBS_get_asn1_uint64(&seq, &max_serial_) || CBS_len(&seq) != 0 ||
+        min_serial_ < (uint64_t{1} << 48) || min_serial_ > max_serial_) {
       OPENSSL_PUT_ERROR(ASN1, ASN1_R_DECODE_ERROR);
       return false;
     }
-    log_hash_ = EVP_parse_digest_algorithm(&log_hash);
-    if (log_hash_ == nullptr) {
-      return false;
-    }
-    if (CBS_len(&log_hash) != 0) {
-      OPENSSL_PUT_ERROR(ASN1, ASN1_R_DECODE_ERROR);
-      return false;
-    }
+    log_hash_ = EVP_sha256();
 
     // Extract the CA ID from the subject (see section 5.1).
     const X509_NAME *subject = X509_get_subject_name(x509);
     int tai_index =
-        X509_NAME_get_index_by_NID(subject, NID_rdna_trustAnchorID_draft, -1);
+        X509_NAME_get_index_by_NID(subject, NID_rdna_trustAnchorID, -1);
     if (tai_index < 0 || X509_NAME_entry_count(subject) != 1) {
       OPENSSL_PUT_ERROR(X509, X509_R_INVALID_MTC_CA);
       return false;
     }
-    // For initial experimentation, the attribute's value is a UTF8String
-    // containing the trust anchor ID's ASCII representation.
-    const ASN1_STRING *tai_ascii =
+    // RELATIVE-OID is not one of BoringSSL's legacy ASN1_STRING types, so the
+    // generic X.509 parser retains the complete DER element as V_ASN1_OTHER.
+    const ASN1_STRING *tai_value =
         X509_NAME_ENTRY_get_data(X509_NAME_get_entry(subject, tai_index));
-    if (ASN1_STRING_type(tai_ascii) != V_ASN1_UTF8STRING) {
+    if (ASN1_STRING_type(tai_value) != V_ASN1_OTHER) {
       OPENSSL_PUT_ERROR(X509, X509_R_WRONG_TYPE);
       return false;
     }
-    std::string_view tai_ascii_str = BytesAsStringView(
-        Span(ASN1_STRING_get0_data(tai_ascii), ASN1_STRING_length(tai_ascii)));
-    ScopedCBB ca_id_enc;
-    if (!CBB_init(ca_id_enc.get(), 64) ||
-        !CBB_add_asn1_relative_oid_from_text(
-            ca_id_enc.get(), tai_ascii_str.data(), tai_ascii_str.size())) {
+    CBS tai_der, tai_contents;
+    CBS_init(&tai_der, ASN1_STRING_get0_data(tai_value),
+             ASN1_STRING_length(tai_value));
+    if (!CBS_get_asn1(&tai_der, &tai_contents, 13 /* RELATIVE-OID */) ||
+        CBS_len(&tai_der) != 0 ||
+        !CBS_is_valid_asn1_relative_oid(&tai_contents) ||
+        !ca_id_enc_oid_.CopyFrom(tai_contents)) {
       OPENSSL_PUT_ERROR(ASN1, ASN1_R_INVALID_OBJECT_ENCODING);
-      return false;
-    }
-    if (!CBBFinishArray(ca_id_enc.get(), &ca_id_enc_oid_)) {
-      OPENSSL_PUT_ERROR(X509, ERR_R_INTERNAL_ERROR);
       return false;
     }
 
@@ -315,7 +305,7 @@ class MTCCACosigner {
 }  // namespace
 
 bool x509_is_merkle_tree_ca(const X509 *x509) {
-  return X509_get_ext_by_NID(x509, NID_pe_mtcCertificationAuthority_draft,
+  return X509_get_ext_by_NID(x509, NID_pe_mtcCertificationAuthority_SHA256,
                              -1) >= 0;
 }
 
@@ -420,7 +410,7 @@ int x509_verify_mtc(const X509 *x509, const EVP_PKEY *pkey,
       !CBS_get_u48(&mtc_proof, &subtree_start) ||
       !CBS_get_u48(&mtc_proof, &subtree_end) ||
       !CBS_get_u16_length_prefixed(&mtc_proof, &inclusion_proof) ||
-      !CBS_get_u16_length_prefixed(&mtc_proof, &signatures) ||
+      !CBS_get_u24_length_prefixed(&mtc_proof, &signatures) ||
       CBS_len(&mtc_proof) != 0) {
     OPENSSL_PUT_ERROR(ASN1, ASN1_R_DECODE_ERROR);
     return 0;

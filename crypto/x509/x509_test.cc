@@ -12046,7 +12046,7 @@ TEST(X509MerkleTreeFileTest, LargeInclusionProofs) {
 
 // Tests for verifying Merkle Tree Certificates. Test data was obtained by
 // running the demo tool github.com/ietf-plants-wg/merkle-tree-certs/demo
-// at revision d7362d6c441463b4e9c7064fa8bb48ee65929585 with the custom config
+// at revision 44b1c0b8c54669a35e8d9e96f0e55bb3cab67757 with the custom config
 // at crypto/x509/test/mtc/mtc_testdata_config.json.
 class X509VerifyMTCTest : public ::testing::Test {
  public:
@@ -12093,7 +12093,7 @@ class X509VerifyMTCTest : public ::testing::Test {
   }
 
   int VerifyMTC(X509 *mtc,
-                unsigned long flags = X509_V_FLAG_USE_MTC_DRAFT_PLANTS_05,
+                unsigned long flags = X509_V_FLAG_USE_MTC_DRAFT_PLANTS_07,
                 X509 *mtc_ca = nullptr) {
     if (!mtc_ca) {
       mtc_ca = mtc_ca_cert_.get();
@@ -12125,7 +12125,7 @@ class X509VerifyMTCTest : public ::testing::Test {
 TEST_F(X509VerifyMTCTest, VerifyMTC) {
   for (X509 *mtc : GetValidTestMTCs()) {
     EXPECT_EQ(X509_V_OK,
-              VerifyMTC(mtc, /*flags=*/X509_V_FLAG_USE_MTC_DRAFT_PLANTS_05));
+              VerifyMTC(mtc, /*flags=*/X509_V_FLAG_USE_MTC_DRAFT_PLANTS_07));
 
     // The flag is required to enable MTC verification.
     EXPECT_EQ(X509_V_ERR_CERT_SIGNATURE_FAILURE, VerifyMTC(mtc, /*flags=*/0));
@@ -12252,14 +12252,14 @@ TEST_F(X509VerifyMTCTest, InvalidMTCCANoExtension) {
   UniquePtr<X509> bad_ca(X509_dup(mtc_ca_cert_.get()));
   ASSERT_TRUE(bad_ca);
   int ext_index = X509_get_ext_by_NID(
-      bad_ca.get(), NID_pe_mtcCertificationAuthority_draft, -1);
+      bad_ca.get(), NID_pe_mtcCertificationAuthority_SHA256, -1);
   ASSERT_GE(ext_index, 0);
   UniquePtr<X509_EXTENSION> ext(X509_delete_ext(bad_ca.get(), ext_index));
   ASSERT_TRUE(ext);
 
   EXPECT_EQ(X509_V_ERR_CERT_SIGNATURE_FAILURE,
             VerifyMTC(mtc_10_subtree_8_11_.get(),
-                      /*flags=*/X509_V_FLAG_USE_MTC_DRAFT_PLANTS_05,
+                      /*flags=*/X509_V_FLAG_USE_MTC_DRAFT_PLANTS_07,
                       /*mtc_ca=*/bad_ca.get()));
   EXPECT_TRUE(ErrorEquals(ERR_get_error(), ERR_LIB_ASN1,
                           ASN1_R_UNKNOWN_SIGNATURE_ALGORITHM));
@@ -12272,7 +12272,7 @@ TEST_F(X509VerifyMTCTest, InvalidMTCCAExtensionNotCritical) {
   UniquePtr<X509> bad_ca_non_critical(X509_dup(mtc_ca_cert_.get()));
   ASSERT_TRUE(bad_ca_non_critical);
   int ext_index = X509_get_ext_by_NID(
-      bad_ca_non_critical.get(), NID_pe_mtcCertificationAuthority_draft, -1);
+      bad_ca_non_critical.get(), NID_pe_mtcCertificationAuthority_SHA256, -1);
   ASSERT_GE(ext_index, 0);
   X509_EXTENSION *ext = X509_get_ext(bad_ca_non_critical.get(), ext_index);
   ASSERT_TRUE(ext);
@@ -12280,7 +12280,7 @@ TEST_F(X509VerifyMTCTest, InvalidMTCCAExtensionNotCritical) {
 
   EXPECT_EQ(X509_V_ERR_CERT_SIGNATURE_FAILURE,
             VerifyMTC(mtc_10_subtree_8_11_.get(),
-                      /*flags=*/X509_V_FLAG_USE_MTC_DRAFT_PLANTS_05,
+                      /*flags=*/X509_V_FLAG_USE_MTC_DRAFT_PLANTS_07,
                       /*mtc_ca=*/bad_ca_non_critical.get()));
   EXPECT_TRUE(
       ErrorEquals(ERR_get_error(), ERR_LIB_X509, X509_R_INVALID_MTC_CA));
@@ -12294,7 +12294,7 @@ TEST_F(X509VerifyMTCTest, InvalidMTCCABadSubject) {
 
   X509_NAME *subject = X509_get_subject_name(bad_ca_no_trust_anchor.get());
   int name_index =
-      X509_NAME_get_index_by_NID(subject, NID_rdna_trustAnchorID_draft, -1);
+      X509_NAME_get_index_by_NID(subject, NID_rdna_trustAnchorID, -1);
   ASSERT_GE(name_index, 0);
   UniquePtr<X509_NAME_ENTRY> entry(X509_NAME_delete_entry(subject, name_index));
   ASSERT_TRUE(entry);
@@ -12309,7 +12309,7 @@ TEST_F(X509VerifyMTCTest, InvalidMTCCABadSubject) {
 
   EXPECT_EQ(X509_V_ERR_CERT_SIGNATURE_FAILURE,
             VerifyMTC(mtc.get(),
-                      /*flags=*/X509_V_FLAG_USE_MTC_DRAFT_PLANTS_05,
+                      /*flags=*/X509_V_FLAG_USE_MTC_DRAFT_PLANTS_07,
                       /*mtc_ca=*/bad_ca_no_trust_anchor.get()));
   EXPECT_TRUE(
       ErrorEquals(ERR_get_error(), ERR_LIB_X509, X509_R_INVALID_MTC_CA));

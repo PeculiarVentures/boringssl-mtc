@@ -14,14 +14,22 @@
 
 #include <openssl/base.h>
 
+#include <cctype>
 #include <memory>
+#include <optional>
+#include <string>
+#include <vector>
 
 #include <openssl/digest.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/hpke.h>
+#include <openssl/pem.h>
+#include <openssl/pool.h>
 #include <openssl/rand.h>
+#include <openssl/sha.h>
 #include <openssl/ssl.h>
+#include <openssl/x509.h>
 
 #include "internal.h"
 #include "transport_common.h"
@@ -68,6 +76,18 @@ static const struct argument kArguments[] = {
         "PEM-encoded file containing the leaf certificate and optional "
         "certificate chain. This is taken from the -key argument if this "
         "argument is not provided.",
+    },
+    {
+        "-mtc-cert",
+        kOptionalArgument,
+        "Properties-first PEM MTC certification path. Requires -key and uses "
+        "the certificate properties credential API.",
+    },
+    {
+        "-credential-set",
+        kOptionalArgument,
+        "GoodEnroll atomic TLS credential-set directory. The server reloads "
+        "the complete generation before each new connection.",
     },
     {
         "-ocsp-response",
@@ -167,6 +187,415 @@ static bool LoadOCSPResponse(SSL_CTX *ctx, const char *filename) {
     return false;
   }
 
+  return true;
+}
+
+static UniquePtr<CRYPTO_BUFFER> X509ToBuffer(X509 *x509) {
+  uint8_t *der = nullptr;
+  const int der_len = i2d_X509(x509, &der);
+  if (der_len < 0) {
+    return nullptr;
+  }
+  UniquePtr<uint8_t> free_der(der);
+  return UniquePtr<CRYPTO_BUFFER>(CRYPTO_BUFFER_new(der, der_len, nullptr));
+}
+
+// LoadMTCCredential loads the exact properties-first representation emitted by
+// GoodEnroll. The returned credential may be installed on an SSL_CTX or on one
+// SSL connection as part of an atomically reloaded credential generation.
+static UniquePtr<SSL_CREDENTIAL> LoadMTCCredential(
+    const std::string &cert_file, const std::string &key_file,
+    Span<const uint8_t> session_id_context = {}) {
+  UniquePtr<BIO> bio(BIO_new(BIO_s_file()));
+  if (!bio || !BIO_read_filename(bio.get(), cert_file.c_str())) {
+    fprintf(stderr, "Failed to open MTC certificate: %s\n", cert_file.c_str());
+    return nullptr;
+  }
+
+  char *pem_name_raw = nullptr;
+  char *pem_header_raw = nullptr;
+  uint8_t *properties_raw = nullptr;
+  long properties_len = 0;
+  if (!PEM_read_bio(bio.get(), &pem_name_raw, &pem_header_raw, &properties_raw,
+                    &properties_len)) {
+    fprintf(stderr, "Failed to read MTC certificate properties.\n");
+    return nullptr;
+  }
+  UniquePtr<char> pem_name(pem_name_raw);
+  UniquePtr<char> pem_header(pem_header_raw);
+  UniquePtr<uint8_t> properties(properties_raw);
+  if (strcmp(pem_name.get(), "CERTIFICATE PROPERTIES") != 0 ||
+      properties_len < 0) {
+    fprintf(stderr,
+            "MTC certificate must begin with CERTIFICATE PROPERTIES.\n");
+    return nullptr;
+  }
+
+  std::vector<UniquePtr<X509>> certs;
+  for (;;) {
+    UniquePtr<X509> cert(
+        PEM_read_bio_X509(bio.get(), nullptr, nullptr, nullptr));
+    if (!cert) {
+      break;
+    }
+    certs.push_back(std::move(cert));
+  }
+  if (certs.empty() ||
+      !ERR_equals(ERR_peek_last_error(), ERR_LIB_PEM, PEM_R_NO_START_LINE)) {
+    fprintf(stderr, "Failed to read MTC certificate chain.\n");
+    return nullptr;
+  }
+  ERR_clear_error();
+
+  std::vector<UniquePtr<CRYPTO_BUFFER>> buffers;
+  std::vector<CRYPTO_BUFFER *> raw_buffers;
+  for (const auto &cert : certs) {
+    buffers.push_back(X509ToBuffer(cert.get()));
+    if (!buffers.back()) {
+      return nullptr;
+    }
+    raw_buffers.push_back(buffers.back().get());
+  }
+
+  UniquePtr<CRYPTO_BUFFER> property_buffer(CRYPTO_BUFFER_new(
+      properties.get(), static_cast<size_t>(properties_len), nullptr));
+  UniquePtr<EVP_PKEY> key = LoadPrivateKeyFile(key_file);
+  UniquePtr<SSL_CREDENTIAL> cred(SSL_CREDENTIAL_new_x509());
+  if (!property_buffer || !key || !cred ||
+      !SSL_CREDENTIAL_set1_cert_chain(cred.get(), raw_buffers.data(),
+                                      raw_buffers.size()) ||
+      !SSL_CREDENTIAL_set1_private_key(cred.get(), key.get()) ||
+      !SSL_CREDENTIAL_set1_certificate_properties(cred.get(),
+                                                  property_buffer.get()) ||
+      (!session_id_context.empty() &&
+       !SSL_CREDENTIAL_set1_session_id_context(
+           cred.get(), session_id_context.data(), session_id_context.size()))) {
+    fprintf(stderr, "Failed to load MTC credential.\n");
+    ERR_print_errors_fp(stderr);
+    return nullptr;
+  }
+  SSL_CREDENTIAL_set_must_match_issuer(cred.get(), 1);
+  return cred;
+}
+
+static bool InstallMTCCredential(SSL_CTX *ctx, const std::string &cert_file,
+                                 const std::string &key_file) {
+  UniquePtr<SSL_CREDENTIAL> cred = LoadMTCCredential(cert_file, key_file);
+  if (!cred || !SSL_CTX_add1_credential(ctx, cred.get())) {
+    fprintf(stderr, "Failed to install MTC credential.\n");
+    ERR_print_errors_fp(stderr);
+    return false;
+  }
+  return true;
+}
+
+struct CredentialSetState {
+  std::string generation;
+  std::vector<UniquePtr<SSL_CREDENTIAL>> credentials;
+};
+
+static bool ReadFile(const std::string &path, std::vector<uint8_t> *out) {
+  ScopedFILE file(fopen(path.c_str(), "rb"));
+  if (!file || !ReadAll(out, file.get())) {
+    fprintf(stderr, "Failed to read credential-set file: %s\n", path.c_str());
+    return false;
+  }
+  return true;
+}
+
+static bool IsHexGeneration(const std::string &generation) {
+  if (generation.size() != 64) {
+    return false;
+  }
+  for (char c : generation) {
+    if (!std::isxdigit(static_cast<unsigned char>(c))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool IsSafeCredentialSetPath(const std::string &path) {
+  if (path.empty() || path[0] == '/' || path.find('\\') != std::string::npos ||
+      path.find('\r') != std::string::npos ||
+      path.find('\n') != std::string::npos ||
+      path.find('\t') != std::string::npos) {
+    return false;
+  }
+  size_t start = 0;
+  while (start <= path.size()) {
+    size_t end = path.find('/', start);
+    if (end == std::string::npos) {
+      end = path.size();
+    }
+    const std::string_view component(path.data() + start, end - start);
+    if (component.empty() || component == "." || component == "..") {
+      return false;
+    }
+    if (end == path.size()) {
+      break;
+    }
+    start = end + 1;
+  }
+  return true;
+}
+
+static std::string CredentialSetPath(const std::string &directory,
+                                     const std::string &relative) {
+  if (!directory.empty() && directory.back() == '/') {
+    return directory + relative;
+  }
+  return directory + "/" + relative;
+}
+
+static bool VerifyCredentialSetObject(const std::string &directory,
+                                      const std::string &relative) {
+  constexpr char kHex[] = "0123456789abcdef";
+  constexpr size_t kDigestHexLength = SHA256_DIGEST_LENGTH * 2;
+  if (relative.size() <= 8 + kDigestHexLength ||
+      relative.compare(0, 8, "objects/") != 0 ||
+      relative[8 + kDigestHexLength] != '.') {
+    fprintf(stderr, "Credential-set object name is invalid: %s\n",
+            relative.c_str());
+    return false;
+  }
+  std::vector<uint8_t> contents;
+  if (!ReadFile(CredentialSetPath(directory, relative), &contents)) {
+    return false;
+  }
+  uint8_t digest[SHA256_DIGEST_LENGTH];
+  SHA256(contents.data(), contents.size(), digest);
+  for (size_t i = 0; i < SHA256_DIGEST_LENGTH; i++) {
+    if (relative[8 + 2 * i] != kHex[digest[i] >> 4] ||
+        relative[8 + 2 * i + 1] != kHex[digest[i] & 0x0f]) {
+      fprintf(stderr, "Credential-set object failed SHA-256: %s\n",
+              relative.c_str());
+      return false;
+    }
+  }
+  return true;
+}
+
+static std::vector<std::string_view> SplitTabs(std::string_view line) {
+  std::vector<std::string_view> out;
+  size_t start = 0;
+  for (;;) {
+    size_t end = line.find('\t', start);
+    if (end == std::string_view::npos) {
+      out.push_back(line.substr(start));
+      return out;
+    }
+    out.push_back(line.substr(start, end - start));
+    start = end + 1;
+  }
+}
+
+static UniquePtr<SSL_CREDENTIAL> LoadX509Credential(
+    const std::string &cert_file, const std::string &key_file,
+    const std::optional<std::string> &properties_file, bool must_match_issuer,
+    Span<const uint8_t> session_id_context) {
+  UniquePtr<BIO> bio(BIO_new(BIO_s_file()));
+  if (!bio || !BIO_read_filename(bio.get(), cert_file.c_str())) {
+    fprintf(stderr, "Failed to open X.509 certificate: %s\n",
+            cert_file.c_str());
+    return nullptr;
+  }
+  std::vector<UniquePtr<X509>> certs;
+  for (;;) {
+    UniquePtr<X509> cert(
+        PEM_read_bio_X509(bio.get(), nullptr, nullptr, nullptr));
+    if (!cert) {
+      break;
+    }
+    certs.push_back(std::move(cert));
+  }
+  if (certs.empty() ||
+      !ERR_equals(ERR_peek_last_error(), ERR_LIB_PEM, PEM_R_NO_START_LINE)) {
+    fprintf(stderr, "Failed to read X.509 certificate chain: %s\n",
+            cert_file.c_str());
+    return nullptr;
+  }
+  ERR_clear_error();
+
+  std::vector<UniquePtr<CRYPTO_BUFFER>> buffers;
+  std::vector<CRYPTO_BUFFER *> raw_buffers;
+  for (const auto &cert : certs) {
+    buffers.push_back(X509ToBuffer(cert.get()));
+    if (!buffers.back()) {
+      return nullptr;
+    }
+    raw_buffers.push_back(buffers.back().get());
+  }
+  UniquePtr<EVP_PKEY> key = LoadPrivateKeyFile(key_file);
+  UniquePtr<SSL_CREDENTIAL> cred(SSL_CREDENTIAL_new_x509());
+  if (!key || !cred ||
+      !SSL_CREDENTIAL_set1_cert_chain(cred.get(), raw_buffers.data(),
+                                      raw_buffers.size()) ||
+      !SSL_CREDENTIAL_set1_private_key(cred.get(), key.get()) ||
+      !SSL_CREDENTIAL_set1_session_id_context(
+          cred.get(), session_id_context.data(), session_id_context.size())) {
+    fprintf(stderr, "Failed to load X.509 credential.\n");
+    ERR_print_errors_fp(stderr);
+    return nullptr;
+  }
+  if (properties_file.has_value()) {
+    std::vector<uint8_t> properties;
+    if (!ReadFile(*properties_file, &properties)) {
+      return nullptr;
+    }
+    UniquePtr<CRYPTO_BUFFER> property_buffer(CRYPTO_BUFFER_new(
+        properties.data(), properties.size(), nullptr));
+    if (!property_buffer || !SSL_CREDENTIAL_set1_certificate_properties(
+                                cred.get(), property_buffer.get())) {
+      fprintf(stderr, "Failed to apply X.509 certificate properties.\n");
+      ERR_print_errors_fp(stderr);
+      return nullptr;
+    }
+  }
+  SSL_CREDENTIAL_set_must_match_issuer(cred.get(), must_match_issuer);
+  return cred;
+}
+
+static bool LoadCredentialSet(const std::string &directory,
+                              CredentialSetState *out) {
+  std::vector<uint8_t> current_raw;
+  if (!ReadFile(CredentialSetPath(directory, "current"), &current_raw)) {
+    return false;
+  }
+  while (!current_raw.empty() &&
+         (current_raw.back() == '\n' || current_raw.back() == '\r')) {
+    current_raw.pop_back();
+  }
+  const std::string generation(current_raw.begin(), current_raw.end());
+  if (!IsHexGeneration(generation)) {
+    fprintf(stderr, "Credential-set current pointer is invalid.\n");
+    return false;
+  }
+  if (out->generation == generation && !out->credentials.empty()) {
+    return true;
+  }
+  const bool is_reload = !out->generation.empty();
+
+  const std::string config_relative =
+      "generations/" + generation + ".conf";
+  std::vector<uint8_t> config_raw;
+  if (!ReadFile(CredentialSetPath(directory, config_relative), &config_raw)) {
+    return false;
+  }
+  const std::string config(config_raw.begin(), config_raw.end());
+  std::vector<UniquePtr<SSL_CREDENTIAL>> credentials;
+  bool saw_header = false;
+  bool saw_generation = false;
+  size_t start = 0;
+  while (start < config.size()) {
+    size_t end = config.find('\n', start);
+    if (end == std::string::npos) {
+      end = config.size();
+    }
+    std::string_view line(config.data() + start, end - start);
+    if (!line.empty() && line.back() == '\r') {
+      line.remove_suffix(1);
+    }
+    start = end + 1;
+    if (line.empty()) {
+      continue;
+    }
+    if (!saw_header) {
+      if (line != "goodenroll-tls-credential-set-v1") {
+        fprintf(stderr, "Credential-set config header is invalid.\n");
+        return false;
+      }
+      saw_header = true;
+      continue;
+    }
+    std::vector<std::string_view> fields = SplitTabs(line);
+    if (fields.size() == 2 && fields[0] == "generation") {
+      if (fields[1] != generation || saw_generation) {
+        fprintf(stderr, "Credential-set generation does not match pointer.\n");
+        return false;
+      }
+      saw_generation = true;
+      continue;
+    }
+    if (fields.size() == 2 && fields[0] == "server-name") {
+      continue;
+    }
+    if (fields.size() != 10 || fields[0] != "credential") {
+      fprintf(stderr, "Credential-set config line is invalid.\n");
+      return false;
+    }
+    const std::string kind(fields[1]);
+    const std::string cert_relative(fields[5]);
+    const std::string key_relative(fields[6]);
+    const std::string properties_relative(fields[7]);
+    if (!IsSafeCredentialSetPath(cert_relative) ||
+        !IsSafeCredentialSetPath(key_relative) ||
+        (properties_relative != "-" &&
+         !IsSafeCredentialSetPath(properties_relative))) {
+      fprintf(stderr, "Credential-set object path is unsafe.\n");
+      return false;
+    }
+    if (!VerifyCredentialSetObject(directory, cert_relative) ||
+        !VerifyCredentialSetObject(directory, key_relative) ||
+        (properties_relative != "-" &&
+         !VerifyCredentialSetObject(directory, properties_relative))) {
+      return false;
+    }
+    const bool must_match_issuer = fields[8] == "true";
+    if (!must_match_issuer && fields[8] != "false") {
+      fprintf(stderr, "Credential-set issuer-matching value is invalid.\n");
+      return false;
+    }
+    auto session_id_context = DecodeHex(std::string(fields[9]));
+    if (!session_id_context || session_id_context->size() != SHA256_DIGEST_LENGTH) {
+      fprintf(stderr, "Credential-set session ID context is invalid.\n");
+      return false;
+    }
+    const std::string cert_file = CredentialSetPath(directory, cert_relative);
+    const std::string key_file = CredentialSetPath(directory, key_relative);
+    UniquePtr<SSL_CREDENTIAL> credential;
+    if (kind == "mtc") {
+      if (!must_match_issuer || properties_relative != "-") {
+        fprintf(stderr, "MTC credential-set entry has invalid properties.\n");
+        return false;
+      }
+      credential = LoadMTCCredential(
+          cert_file, key_file,
+          Span<const uint8_t>(session_id_context->data(),
+                              session_id_context->size()));
+    } else if (kind == "x509") {
+      std::optional<std::string> properties_file;
+      if (properties_relative != "-") {
+        properties_file = CredentialSetPath(directory, properties_relative);
+      }
+      if (must_match_issuer && !properties_file.has_value()) {
+        fprintf(stderr,
+                "Issuer-matched X.509 credential has no properties.\n");
+        return false;
+      }
+      credential = LoadX509Credential(
+          cert_file, key_file, properties_file, must_match_issuer,
+          Span<const uint8_t>(session_id_context->data(),
+                              session_id_context->size()));
+    } else {
+      fprintf(stderr, "Unknown credential-set kind: %s\n", kind.c_str());
+      return false;
+    }
+    if (!credential) {
+      return false;
+    }
+    credentials.push_back(std::move(credential));
+  }
+  if (!saw_header || !saw_generation || credentials.empty()) {
+    fprintf(stderr, "Credential-set config is incomplete.\n");
+    return false;
+  }
+  out->generation = generation;
+  out->credentials = std::move(credentials);
+  fprintf(stderr,
+          "%s credential-set generation %s with %zu credentials.\n",
+          is_reload ? "Reloaded" : "Loaded", generation.c_str(),
+          out->credentials.size());
   return true;
 }
 
@@ -294,6 +723,9 @@ bool Server(const std::vector<std::string> &args) {
 
   bssl::UniquePtr<SSL_CTX> ctx(SSL_CTX_new(TLS_method()));
 
+  const bool use_credential_set = args_map.count("-credential-set") != 0;
+  CredentialSetState credential_set;
+
   const char *keylog_file = getenv("SSLKEYLOGFILE");
   if (keylog_file) {
     g_keylog_file = fopen(keylog_file, "a");
@@ -306,7 +738,34 @@ bool Server(const std::vector<std::string> &args) {
 
   // Server authentication is required.
   bool installed_cred = false;
-  if (args_map.count("-key") != 0) {
+  if (use_credential_set) {
+    if (args_map.count("-key") != 0 || args_map.count("-cert") != 0 ||
+        args_map.count("-mtc-cert") != 0 ||
+        args_map.count("-rpk-key") != 0) {
+      fprintf(stderr,
+              "-credential-set is mutually exclusive with -key, -cert, "
+              "-mtc-cert, and -rpk-key.\n");
+      return false;
+    }
+    if (!LoadCredentialSet(args_map["-credential-set"], &credential_set)) {
+      return false;
+    }
+    installed_cred = true;
+  } else if (args_map.count("-mtc-cert") != 0) {
+    if (args_map.count("-key") == 0) {
+      fprintf(stderr, "-mtc-cert requires -key.\n");
+      return false;
+    }
+    if (args_map.count("-cert") != 0) {
+      fprintf(stderr, "-mtc-cert and -cert are mutually exclusive.\n");
+      return false;
+    }
+    if (!InstallMTCCredential(ctx.get(), args_map["-mtc-cert"],
+                              args_map["-key"])) {
+      return false;
+    }
+    installed_cred = true;
+  } else if (args_map.count("-key") != 0) {
     std::string key = args_map["-key"];
     if (!SSL_CTX_use_PrivateKey_file(ctx.get(), key.c_str(),
                                      SSL_FILETYPE_PEM)) {
@@ -505,7 +964,24 @@ bool Server(const std::vector<std::string> &args) {
     }
 
     BIO *bio = BIO_new_socket(sock, BIO_CLOSE);
+    if (use_credential_set) {
+      if (!LoadCredentialSet(args_map["-credential-set"], &credential_set)) {
+        fprintf(stderr,
+                "Credential-set reload failed; retaining generation %s.\n",
+                credential_set.generation.c_str());
+        ERR_clear_error();
+      }
+    }
     bssl::UniquePtr<SSL> ssl(SSL_new(ctx.get()));
+    if (use_credential_set) {
+      for (const auto &credential : credential_set.credentials) {
+        if (!SSL_add1_credential(ssl.get(), credential.get())) {
+          fprintf(stderr, "Failed to attach credential-set generation.\n");
+          ERR_print_errors_fp(stderr);
+          return false;
+        }
+      }
+    }
     SSL_set_bio(ssl.get(), bio, bio);
 
     if (args_map.count("-jdk11-workaround") != 0) {

@@ -5511,26 +5511,6 @@ extern "C" {
 #define SN_X_Wing "X-Wing"
 #define NID_X_Wing 972
 
-#define SN_alg_mtcProof_draft "alg-mtcProof-draft"
-#define NID_alg_mtcProof_draft 976
-#define OBJ_alg_mtcProof_draft 1L, 3L, 6L, 1L, 4L, 1L, 44363L, 47L, 0L
-#define OBJ_ENC_alg_mtcProof_draft \
-  0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0xda, 0x4b, 0x2f, 0x00
-
-#define SN_rdna_trustAnchorID_draft "rdna-trustAnchorID-draft"
-#define NID_rdna_trustAnchorID_draft 977
-#define OBJ_rdna_trustAnchorID_draft 1L, 3L, 6L, 1L, 4L, 1L, 44363L, 47L, 1L
-#define OBJ_ENC_rdna_trustAnchorID_draft \
-  0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0xda, 0x4b, 0x2f, 0x01
-
-#define SN_pe_mtcCertificationAuthority_draft \
-  "pe-mtcCertificationAuthority-draft"
-#define NID_pe_mtcCertificationAuthority_draft 978
-#define OBJ_pe_mtcCertificationAuthority_draft \
-  1L, 3L, 6L, 1L, 4L, 1L, 44363L, 47L, 2L
-#define OBJ_ENC_pe_mtcCertificationAuthority_draft \
-  0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0xda, 0x4b, 0x2f, 0x02
-
 #define SN_SLH_DSA_SHA2_128s "id-slh-dsa-sha2-128s"
 #define LN_SLH_DSA_SHA2_128s "SLH-DSA-SHA2-128s"
 #define NID_SLH_DSA_SHA2_128s 979
@@ -5552,6 +5532,25 @@ extern "C" {
   2L, 16L, 840L, 1L, 101L, 3L, 4L, 3L, 35L
 #define OBJ_ENC_SLH_DSA_SHA2_128s_WITH_SHA256 \
   0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x23
+
+#define SN_alg_mtcProof "alg-mtcProof"
+#define NID_alg_mtcProof 982
+#define OBJ_alg_mtcProof 1L, 3L, 6L, 1L, 5L, 5L, 7L, 6L, 67L
+#define OBJ_ENC_alg_mtcProof 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x06, 0x43
+
+#define SN_rdna_trustAnchorID "rdna-trustAnchorID"
+#define NID_rdna_trustAnchorID 983
+#define OBJ_rdna_trustAnchorID 1L, 3L, 6L, 1L, 5L, 5L, 7L, 25L, 3L
+#define OBJ_ENC_rdna_trustAnchorID \
+  0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x19, 0x03
+
+#define SN_pe_mtcCertificationAuthority_SHA256 \
+  "pe-mtcCertificationAuthority-SHA256"
+#define NID_pe_mtcCertificationAuthority_SHA256 984
+#define OBJ_pe_mtcCertificationAuthority_SHA256 \
+  1L, 3L, 6L, 1L, 5L, 5L, 7L, 1L, 38L
+#define OBJ_ENC_pe_mtcCertificationAuthority_SHA256 \
+  0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x26
 
 
 #if defined(__cplusplus)

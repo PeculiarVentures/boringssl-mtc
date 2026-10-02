@@ -27,6 +27,7 @@
 #include <openssl/bytestring.h>
 #include <openssl/digest.h>
 #include <openssl/err.h>
+#include <openssl/pem.h>
 #include <openssl/ssl.h>
 
 #include "internal.h"
@@ -34,6 +35,31 @@
 
 
 BSSL_NAMESPACE_BEGIN
+
+static bool LoadMTCRootTrust(SSL_CTX *ctx, const std::string &path) {
+  UniquePtr<BIO> bio(BIO_new_file(path.c_str(), "rb"));
+  if (!bio) {
+    return false;
+  }
+  bool found = false;
+  for (;;) {
+    UniquePtr<X509> cert(PEM_read_bio_X509(bio.get(), nullptr, nullptr, nullptr));
+    if (!cert) {
+      ERR_clear_error();
+      break;
+    }
+    if (X509_get_ext_by_NID(cert.get(),
+                            NID_pe_mtcCertificationAuthority_SHA256, -1) < 0) {
+      continue;
+    }
+    found = true;
+    if (!X509_add1_trust_object(cert.get(), OBJ_nid2obj(NID_server_auth)) ||
+        !X509_STORE_add_cert(SSL_CTX_get_cert_store(ctx), cert.get())) {
+      return false;
+    }
+  }
+  return found;
+}
 
 static const struct argument kArguments[] = {
     {
@@ -174,6 +200,11 @@ static const struct argument kArguments[] = {
         "A directory containing one or more root certificate PEM files in "
         "OpenSSL's hashed-directory format. Implies that verification is "
         "required.",
+    },
+    {
+        "-enable-mtc",
+        kBooleanArgument,
+        "Enable current PLANTS Merkle Tree Certificate verification.",
     },
     {
         "-early-data",
@@ -639,6 +670,12 @@ bool Client(const std::vector<std::string> &args) {
 
   // Configure accepted roots.
   if (args_map.count("-root-certs") != 0) {
+    if (args_map.count("-enable-mtc") != 0 &&
+        !LoadMTCRootTrust(ctx.get(), args_map["-root-certs"])) {
+      fprintf(stderr, "Failed to load an MTC trust anchor.\n");
+      ERR_print_errors_fp(stderr);
+      return false;
+    }
     if (!SSL_CTX_load_verify_locations(
             ctx.get(), args_map["-root-certs"].c_str(), nullptr)) {
       fprintf(stderr, "Failed to load root certificates.\n");
@@ -655,6 +692,12 @@ bool Client(const std::vector<std::string> &args) {
       return false;
     }
     SSL_CTX_set_verify(ctx.get(), SSL_VERIFY_PEER, nullptr);
+  }
+  if (args_map.count("-enable-mtc") != 0 &&
+      !X509_VERIFY_PARAM_set_flags(SSL_CTX_get0_param(ctx.get()),
+                                   X509_V_FLAG_USE_MTC_DRAFT_PLANTS_07)) {
+    fprintf(stderr, "Failed to enable MTC verification.\n");
+    return false;
   }
   // Otherwise, just require the server to send any cert.
   if (args_map.count("-root-certs") == 0 &&

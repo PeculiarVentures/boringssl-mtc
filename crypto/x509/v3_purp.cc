@@ -143,7 +143,7 @@ int X509_supported_extension(const X509_EXTENSION *ex) {
          nid == NID_name_constraints ||      //
          nid == NID_policy_mappings ||       //
          nid == NID_inhibit_any_policy ||
-         nid == NID_pe_mtcCertificationAuthority_draft;
+         nid == NID_pe_mtcCertificationAuthority_SHA256;
 }
 
 static int setup_crldp(X509 *x) {
